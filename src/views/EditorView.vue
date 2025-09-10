@@ -97,7 +97,10 @@
                 opacity: 0.02,
                 stroke: '#ffffff22',
                 strokeWidth: 1,
+                name: 'bg',
+                listening: true,
               }"
+              @click="deselectBG"
             />
             <!-- Grid sobre el artboard -->
             <v-rect
@@ -153,8 +156,8 @@
                   rotation: item.rotation,
                   scaleX: item.scaleX,
                   scaleY: item.scaleY,
-                  width: item.width,            <!-- 👈 -->
-                  height: item.height,          <!-- 👈 -->
+                  width: item.width,
+                  height: item.height,
                   draggable: !item.locked,
                   visible: item.visible,
                   listening: !item.locked,
@@ -194,7 +197,7 @@
               />
             </template>
 
-            <v-transformer ref="trRef" :config="{ rotateEnabled: true }" />
+            <v-transformer ref="trRef" :config="trConfig" />
           </v-layer>
 
           <!-- ⭐ Capa de guías -->
@@ -273,12 +276,15 @@ import {
   computed,
 } from 'vue'
 import LayersPanel from '@/components/LayersPanel.vue'
-import { useCanvasStore, type TextItem } from '@/stores/canvas'
+import { useCanvasStore, type CanvasItem, type TextItem, type ImageItem, isText, isImage, type RectItem } from '@/stores/canvas';
 import PropertiesPanel from '@/components/PropertiesPanel.vue'
 
 import type { Stage as KonvaStage } from 'konva/lib/Stage'
 import type { Transformer as KonvaTransformer } from 'konva/lib/shapes/Transformer'
 import type { Text as KonvaText } from 'konva/lib/shapes/Text'
+import { useGrid } from '@/composables/useGrid';
+import { useSnap } from '@/composables/useSnap';
+import { useKonvaBindings } from '@/composables/useKonvaBindings';
 
 const store = useCanvasStore()
 
@@ -289,6 +295,7 @@ const trRef = ref<any>(null)
 const fileInput = ref<HTMLInputElement | null>(null)
 // refs y medidas existentes...
 const guidesLayerRef = ref<any>(null)
+const editingNode = ref<KonvaText | null>(null)
 
 // ---- Presets ----
 const presetName = ref<string>('')
@@ -301,47 +308,39 @@ const boardH = 500
 const boardX = computed(() => (stageW.value - boardW) / 2)
 const boardY = computed(() => (stageH.value - boardH) / 2)
 
-// === GRID ===
-const gridShow = ref(true)
-const gridSnap = ref(true)
-const gridSize = ref(20)
-const gridPattern = ref<HTMLCanvasElement | null>(null)
+const importOpen = ref(false)
+const importText = ref('')
+const importFile = ref<HTMLInputElement | null>(null)
 
-watch(gridSize, makeGridPattern, { immediate: true })
+const trConfig = computed(() => {
+  const it = store.selectedId ? store.items.find((i) => i.id === store.selectedId) : null
+  const uniform = !!it && (it.type === 'text' || it.type === 'image')
+  return {
+    rotateEnabled: true,
+    keepRatio: uniform, // mantiene proporción
+    enabledAnchors: uniform ? ['top-left', 'top-right', 'bottom-left', 'bottom-right'] : undefined,
+    anchorSize: 8,
+    borderStroke: '#2ee7ff',
+    anchorStroke: '#2ee7ff',
+    anchorFill: '#0ea5e9',
+    ignoreStroke: true,
+  }
+})
 
-function makeGridPattern() {
-  const s = Math.max(4, Math.floor(gridSize.value))
-  const c = document.createElement('canvas')
-  c.width = s
-  c.height = s
-  const ctx = c.getContext('2d')!
-  ctx.clearRect(0, 0, s, s)
 
-  // líneas finas (0.5 para pixel perfect)
-  ctx.strokeStyle = 'rgba(255,255,255,0.10)'
-  ctx.lineWidth = 1
 
-  // vertical en x=0
-  ctx.beginPath()
-  ctx.moveTo(0.5, 0)
-  ctx.lineTo(0.5, s)
-  ctx.stroke()
+// Un parciales por tipo SIN el 'type' ni 'id'
+type PText  = Partial<Omit<TextItem,  'type' | 'id'>> & { type: 'text';  id?: string };
+type PImage = Partial<Omit<ImageItem, 'type' | 'id'>> & { type: 'image'; id?: string };
+type PRect  = Partial<Omit<RectItem,  'type' | 'id'>> & { type: 'rect';  id?: string };
 
-  // horizontal en y=0
-  ctx.beginPath()
-  ctx.moveTo(0, 0.5)
-  ctx.lineTo(s, 0.5)
-  ctx.stroke()
+// Unión discriminada correcta
+export type PItem = PText | PImage | PRect;
 
-  gridPattern.value = c
-}
-
-type PItem = Partial<TextItem> & { id?: string; type: 'text' | 'rect' | 'image' } & Record<
-    string,
-    any
-  >
-type Preset = { canvas?: { width: number; height: number }; items: PItem[] }
-
+export type Preset = {
+  canvas?: { width: number; height: number };
+  items: PItem[];
+};
 const presets: Record<string, Preset> = {
   centerText: {
     items: [
@@ -469,9 +468,12 @@ function exportJSON() {
   URL.revokeObjectURL(a.href)
 }
 
-const importOpen = ref(false)
-const importText = ref('')
-const importFile = ref<HTMLInputElement | null>(null)
+function showEditingNode(show: boolean) {
+  const layer = layerRef.value?.getNode()
+  if (!editingNode.value || !layer) return
+  editingNode.value.visible(show)
+  layer.batchDraw()
+}
 
 function openImport() {
   importOpen.value = true
@@ -519,12 +521,8 @@ function applyImport() {
 
 // ========== Guías ==========
 type Guide = { o: 'V' | 'H'; pos: number } // orientación y posición
-const guides = reactive<Guide[]>([])
 const SNAP = 6 // umbral de snap en px
 
-function clearGuides() {
-  guides.splice(0, guides.length)
-}
 function pushGuide(g: Guide) {
   guides.push(g)
 }
@@ -556,14 +554,6 @@ function getLineGuideStops(excludeId?: string) {
   return { sx, sy }
 }
 
-/** Bounding box del item (usa client rect de Konva) */
-function getNodeRectById(id: string) {
-  const stage = stageRef.value?.getNode()
-  const node = stage?.findOne(`#${id}`)
-  if (!node) return null
-  const r = node.getClientRect({ skipShadow: true, skipStroke: false })
-  return { x: r.x, y: r.y, w: r.width, h: r.height, node }
-}
 function getItemRect(it: any) {
   // aproximación con sus props (mejor usar getClientRect si está en escena)
   const nr = getNodeRectById(it.id)
@@ -632,23 +622,12 @@ function getSnapOffsets(id: string) {
   return { dx, dy, v: bestV?.stop ?? null, h: bestH?.stop ?? null }
 }
 
-/** Aplicar snapping durante drag/transform (suave) */
-function applySnap(id: string) {
-  clearGuides()
-  const s = getSnapOffsets(id)
-  const stage = stageRef.value?.getNode()
-  const n = stage?.findOne(`#${id}`)
-  if (!n) return
-
-  if (s.v !== null) pushGuide({ o: 'V', pos: s.v })
-  if (s.h !== null) pushGuide({ o: 'H', pos: s.h })
-
-  if (s.dx || s.dy) {
-    n.x(n.x() + s.dx)
-    n.y(n.y() + s.dy)
-  }
-}
 const imageMap = reactive<Record<string, HTMLImageElement | null>>({})
+
+// Composables
+const { getNodeRectById, bindTransformer, rebindNextTick } = useKonvaBindings(stageRef, layerRef, trRef);
+const { guides, clearGuides, applySnap } = useSnap(stageRef, store, boardX, boardY, boardW, boardH);
+const { gridShow, gridSnap, gridSize, gridPattern, snapNodeToGrid } = useGrid();
 
 // ========= Persistencia inicial =========
 onMounted(() => {
@@ -697,6 +676,10 @@ function onTextDblClick(item: TextItem, e: any) {
   const abs = textNode.getAbsolutePosition()
   const rect = stage.container().getBoundingClientRect()
 
+  // 🔒 oculta el nodo original mientras editas
+  editingNode.value = textNode
+  showEditingNode(false)
+
   editing.value = {
     id: item.id,
     value: item.text,
@@ -712,10 +695,10 @@ function onTextDblClick(item: TextItem, e: any) {
       padding: '0px',
       margin: '0px',
       background: 'transparent',
+      zIndex: 9999,
     },
   }
 
-  // Ocultar transformer durante edición
   const tr = trRef.value?.getNode() as KonvaTransformer | undefined
   if (tr) tr.nodes([])
 
@@ -735,10 +718,14 @@ function commitEdit() {
   if (!editing.value) return
   store.updateItem(editing.value.id, { text: editing.value.value })
   editing.value = null
+  showEditingNode(true) // 👈 vuelve a mostrar
+  editingNode.value = null
 }
 
 function cancelEdit() {
   editing.value = null
+  showEditingNode(true) // 👈 vuelve a mostrar
+  editingNode.value = null
 }
 
 // ========= Resto (igual que ya tenías) =========
@@ -747,6 +734,7 @@ function loadImageFor(id: string, src: string) {
   img.crossOrigin = 'anonymous'
   img.onload = () => {
     imageMap[id] = img
+    if (store.selectedId === id) nextTick(()=>bindTransformer(store.selectedId)) // 👈
   }
   img.onerror = () => {
     console.warn('No se pudo cargar imagen')
@@ -777,23 +765,44 @@ async function onPickImage(e: Event) {
   const files = (e.target as HTMLInputElement).files
   if (!files || !files[0]) return
   const file = files[0]
+
   const dataUrl = await fileToDataURL(file)
+  const el = await loadImageElement(dataUrl) // 👈 cargamos para saber dimensiones
+  const maxW = Math.floor(boardW * 0.6) // ancho máximo inicial (ajusta a gusto)
+  const scale = Math.min(1, maxW / el.width)
+  const w = Math.round(el.width * scale)
+  const h = Math.round(el.height * scale)
+
   const id = crypto.randomUUID()
   store.addItem({
     id,
     type: 'image',
     src: dataUrl,
-    x: (stageW.value - 300) / 2,
-    y: (stageH.value - 300) / 2,
+    x: boardX.value + Math.round((boardW - w) / 2),
+    y: boardY.value + Math.round((boardH - h) / 2),
     rotation: 0,
     scaleX: 1,
     scaleY: 1,
     draggable: true,
     visible: true,
     locked: false,
+    width: w, // 👈 guardamos tamaño real
+    height: h, // 👈
   })
-  loadImageFor(id, dataUrl)
+
+  imageMap[id] = el // cache de la imagen
+  if (store.selectedId === id) nextTick(()=>bindTransformer(store.selectedId))
   if (fileInput.value) fileInput.value.value = ''
+}
+
+function loadImageElement(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.crossOrigin = 'anonymous'
+    img.onload = () => resolve(img)
+    img.onerror = () => reject(new Error('No se pudo cargar la imagen'))
+    img.src = src
+  })
 }
 
 function removeSelected() {
@@ -812,8 +821,20 @@ function select(id: string) {
   store.select(id)
 }
 
+function deselectBG() {
+  store.select(null)
+  clearGuides()
+}
+
 function onStagePointer(e: any) {
-  if (e.target === stageRef.value?.getNode()) store.select(null)
+  const stage = stageRef.value?.getNode()
+  const layer = layerRef.value?.getNode()
+  const t = e.target
+  const isBG = typeof t.name === 'function' && t.name() === 'bg'
+  if (t === stage || t === layer || isBG) {
+    store.select(null)
+    clearGuides()
+  }
 }
 
 function onDragMove(id: string, e: any) {
@@ -821,25 +842,56 @@ function onDragMove(id: string, e: any) {
   applySnap(id)
 }
 
-function onDragEnd(id: string, e: any) {
-  clearGuides()
-  const node = e.target
-  snapNodeToGrid(node) // 👈
-  store.updateItem(id, { x: node.x(), y: node.y() })
+function onDragEnd(id:string, e:any){
+  clearGuides();
+  const node = e.target; snapNodeToGrid(node, boardX.value, boardY.value);
+  store.updateItem(id, { x: node.x(), y: node.y() });
+}
+
+function onTransform(id: string, e: any) {
+  if (store.items.find((i) => i.id === id)?.locked) return
+  applySnap(id)
 }
 
 function onTransformEnd(id: string, e: any) {
-  clearGuides()
-  const node = e.target
-  snapNodeToGrid(node) // 👈
+  clearGuides();
+  const n = e.target;
+  const it = store.items.find(i => i.id === id);
+  if (!it) return;
+
+  if (isImage(it)) {
+    const baseW = it.width;
+    const baseH = it.height;
+    const newW = Math.max(1, Math.round(baseW * n.scaleX()));
+    const newH = Math.max(1, Math.round(baseH * n.scaleY()));
+    n.scaleX(1); n.scaleY(1);
+    store.updateItem(id, {
+      x: n.x(), y: n.y(), rotation: n.rotation(),
+      width: newW, height: newH, scaleX: 1, scaleY: 1,
+    });
+    return;
+  }
+
+  if (isText(it)) {
+    const baseSize = it.fontSize || 16;
+    const uniformScale = (n.scaleX() + n.scaleY()) / 2;
+    const newSize = Math.max(1, Math.round(baseSize * uniformScale));
+    n.scaleX(1); n.scaleY(1);
+    store.updateItem(id, {
+      x: n.x(), y: n.y(), rotation: n.rotation(),
+      fontSize: newSize, scaleX: 1, scaleY: 1,
+    });
+    return;
+  }
+
+  // rect u otros
   store.updateItem(id, {
-    x: node.x(),
-    y: node.y(),
-    rotation: node.rotation(),
-    scaleX: node.scaleX(),
-    scaleY: node.scaleY(),
-  })
+    x: n.x(), y: n.y(),
+    rotation: n.rotation(),
+    scaleX: n.scaleX(), scaleY: n.scaleY(),
+  });
 }
+
 
 function exportPNG() {
   const stage = stageRef.value?.getNode() as KonvaStage | undefined
@@ -860,12 +912,17 @@ function fileToDataURL(file: File): Promise<string> {
   })
 }
 
-function snapNodeToGrid(node: any) {
-  if (!gridSnap.value) return
-  const s = Math.max(4, Math.floor(gridSize.value))
-  const tx = Math.round((node.x() - boardX.value) / s) * s + boardX.value
-  const ty = Math.round((node.y() - boardY.value) / s) * s + boardY.value
-  node.x(tx)
-  node.y(ty)
-}
+// Re-engancha cuando cambia la selección
+watch(
+  () => store.selectedId,
+  () => nextTick(()=>bindTransformer(store.selectedId)),
+)
+
+// Re-engancha ante cambios estructurales (tamaño, visibilidad, etc.)
+watch(
+  () => store.items,
+  () => nextTick(()=>bindTransformer(store.selectedId)),
+  { deep: true },
+)
+
 </script>
